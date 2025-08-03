@@ -36,27 +36,8 @@ def spotify_callback_redirect():
     code = request.args.get("code")
     return redirect(f"{FRONTEND_REDIRECT}?code={code}")
 
-# @app.route("/callback", methods=["POST"])
-# def spotify_callback_exchange():
-#     data = request.get_json()
-#     code = data.get("code")
-
-#     sp_oauth = get_spotify_oauth()
-#     token_info = sp_oauth.get_access_token(code)
-
-#     sp = spotipy.Spotify(auth=token_info['access_token'])
-#     playlists_data = sp.current_user_playlists(limit=50)
-
-#     playlists = [{
-#         "id": p["id"],
-#         "name": p["name"],
-#         "tracks_total": p["tracks"]["total"]
-#     } for p in playlists_data["items"]]
-
-#     return jsonify(playlists_data)
-
-@app.route("/callback", methods=["POST"])
-def callback():
+@app.route("/fetch_playlists", methods=["POST"])
+def fetch_playlists():
     data = request.get_json()
     code = data.get("code")
 
@@ -85,6 +66,7 @@ def callback():
             break
 
     return jsonify(playlists)
+
 
 
 if __name__ == "__main__":
