@@ -42,6 +42,8 @@ def fetch_playlists():
     code = data.get("code")
 
     sp_oauth = get_spotify_oauth()
+    session.permanent = True
+
     token_info = sp_oauth.get_access_token(code)
 
     sp = spotipy.Spotify(auth=token_info['access_token'])
@@ -67,7 +69,40 @@ def fetch_playlists():
 
     return jsonify(playlists)
 
+@app.route("/playlist_tracks", methods=["POST"])
+def playlist_tracks():
+    data = request.get_json()
+    playlist_id = data.get("playlist_id")
+    if not playlist_id:
+        return jsonify({"error": "playlist_id is required"}), 400
+    
+    session.permanent = True
+    data = request.get_json()
+    code = data.get("code")
 
+    sp_oauth = get_spotify_oauth()
+    session.permanent = True
+
+    token_info = sp_oauth.get_access_token(code)
+
+    print(token_info)
+    if not token_info:
+        return jsonify({"error": "Not authenticated"}), 401
+
+    sp = spotipy.Spotify(auth=token_info["access_token"])
+    results = sp.playlist_tracks(playlist_id)
+    
+    tracks = []
+    for item in results["items"]:
+        track = item["track"]
+        if track:
+            tracks.append({
+                "name": track["name"],
+                "artist": ", ".join([artist["name"] for artist in track["artists"]]),
+                "album": track["album"]["name"]
+            })
+
+    return jsonify(tracks)
 
 if __name__ == "__main__":
     app.run(debug=True)
