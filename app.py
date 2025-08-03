@@ -36,8 +36,27 @@ def spotify_callback_redirect():
     code = request.args.get("code")
     return redirect(f"{FRONTEND_REDIRECT}?code={code}")
 
+# @app.route("/callback", methods=["POST"])
+# def spotify_callback_exchange():
+#     data = request.get_json()
+#     code = data.get("code")
+
+#     sp_oauth = get_spotify_oauth()
+#     token_info = sp_oauth.get_access_token(code)
+
+#     sp = spotipy.Spotify(auth=token_info['access_token'])
+#     playlists_data = sp.current_user_playlists(limit=50)
+
+#     playlists = [{
+#         "id": p["id"],
+#         "name": p["name"],
+#         "tracks_total": p["tracks"]["total"]
+#     } for p in playlists_data["items"]]
+
+#     return jsonify(playlists_data)
+
 @app.route("/callback", methods=["POST"])
-def spotify_callback_exchange():
+def callback():
     data = request.get_json()
     code = data.get("code")
 
@@ -45,15 +64,28 @@ def spotify_callback_exchange():
     token_info = sp_oauth.get_access_token(code)
 
     sp = spotipy.Spotify(auth=token_info['access_token'])
-    playlists_data = sp.current_user_playlists(limit=50)
 
-    playlists = [{
-        "id": p["id"],
-        "name": p["name"],
-        "tracks_total": p["tracks"]["total"]
-    } for p in playlists_data["items"]]
+    playlists = []
+    limit = 50
+    offset = 0
+
+    while True:
+        response = sp.current_user_playlists(limit=limit, offset=offset)
+        items = response.get("items", [])
+        playlists.extend([
+            {
+                "id": p["id"],
+                "name": p["name"],
+                "tracks_total": p["tracks"]["total"]
+            } for p in items
+        ])
+        if response.get("next"):
+            offset += limit
+        else:
+            break
 
     return jsonify(playlists)
+
 
 if __name__ == "__main__":
     app.run(debug=True)
