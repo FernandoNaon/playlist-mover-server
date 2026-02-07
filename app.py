@@ -9,9 +9,12 @@ import tidalapi
 load_dotenv()
 
 app = Flask(__name__)
+
+# CORS Configuration - support both local and production
+FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://localhost:5173")
 CORS(app,
      supports_credentials=True,
-     origins=["http://localhost:5173"],
+     origins=[FRONTEND_URL, "http://localhost:5173", "http://127.0.0.1:5173"],
      allow_headers=["Content-Type", "Authorization"],
      methods=["GET", "POST", "OPTIONS"])
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "supersecretkey")
@@ -25,7 +28,7 @@ SPOTIPY_REDIRECT_URI = os.environ.get("SPOTIPY_REDIRECT_URI", "http://127.0.0.1:
 TIDAL_CLIENT_ID = os.environ.get("TIDAL_CLIENT_ID")
 TIDAL_CLIENT_SECRET = os.environ.get("TIDAL_CLIENT_SECRET")
 
-FRONTEND_REDIRECT = "http://localhost:5173/callback"
+FRONTEND_REDIRECT = os.environ.get("FRONTEND_REDIRECT", "http://localhost:5173/callback")
 
 # Extended scopes for dashboard insights
 SCOPE = "playlist-read-private playlist-read-collaborative user-top-read user-read-recently-played user-library-read user-read-private user-follow-read"
@@ -400,6 +403,177 @@ def tidal_check_auth():
         import traceback
         traceback.print_exc()
         return jsonify({"error": str(e), "authenticated": False}), 500
+
+
+@app.route("/tidal/playlists", methods=["POST"])
+def tidal_playlists():
+    """Get user's Tidal playlists."""
+    data = request.get_json()
+    session_id = data.get("session_id")
+
+    if not session_id or session_id not in tidal_sessions:
+        return jsonify({"error": "Invalid session"}), 400
+
+    try:
+        tidal_session = tidal_sessions[session_id]["session"]
+        user_playlists = tidal_session.user.playlists()
+
+        playlists = []
+        for p in user_playlists:
+            # Get image URL - image() is a method in tidalapi
+            image_url = None
+            try:
+                if hasattr(p, 'image') and callable(p.image):
+                    image_url = p.image(320)  # Get 320x320 image
+                elif hasattr(p, 'picture') and p.picture:
+                    image_url = f"https://resources.tidal.com/images/{p.picture.replace('-', '/')}/320x320.jpg"
+                elif hasattr(p, 'square_picture') and p.square_picture:
+                    image_url = f"https://resources.tidal.com/images/{p.square_picture.replace('-', '/')}/320x320.jpg"
+            except:
+                pass
+
+            playlists.append({
+                "id": str(p.id),
+                "name": p.name,
+                "tracks_total": p.num_tracks if hasattr(p, 'num_tracks') else 0,
+                "image": image_url,
+                "description": p.description if hasattr(p, 'description') else ""
+            })
+
+        return jsonify(playlists)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/tidal/playlist_tracks", methods=["POST"])
+def tidal_playlist_tracks():
+    """Get tracks from a Tidal playlist."""
+    data = request.get_json()
+    session_id = data.get("session_id")
+    playlist_id = data.get("playlist_id")
+
+    if not session_id or session_id not in tidal_sessions:
+        return jsonify({"error": "Invalid session"}), 400
+    if not playlist_id:
+        return jsonify({"error": "Playlist ID required"}), 400
+
+    try:
+        tidal_session = tidal_sessions[session_id]["session"]
+        playlist = tidal_session.playlist(playlist_id)
+        playlist_tracks = playlist.tracks()
+
+        tracks = []
+        for track in playlist_tracks:
+            # Get album image URL - image() is a method in tidalapi
+            image_url = None
+            try:
+                if track.album:
+                    if hasattr(track.album, 'image') and callable(track.album.image):
+                        image_url = track.album.image(320)
+                    elif hasattr(track.album, 'cover') and track.album.cover:
+                        image_url = f"https://resources.tidal.com/images/{track.album.cover.replace('-', '/')}/320x320.jpg"
+            except:
+                pass
+
+            tracks.append({
+                "id": str(track.id),
+                "name": track.name,
+                "artist": track.artist.name if track.artist else "Unknown",
+                "album": track.album.name if track.album else "Unknown",
+                "duration_ms": track.duration * 1000 if hasattr(track, 'duration') else 0,
+                "image": image_url
+            })
+
+        return jsonify(tracks)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/tidal/delete_playlist", methods=["POST"])
+def tidal_delete_playlist():
+    """Delete a Tidal playlist."""
+    data = request.get_json()
+    session_id = data.get("session_id")
+    playlist_id = data.get("playlist_id")
+
+    if not session_id or session_id not in tidal_sessions:
+        return jsonify({"error": "Invalid session"}), 400
+    if not playlist_id:
+        return jsonify({"error": "Playlist ID required"}), 400
+
+    try:
+        tidal_session = tidal_sessions[session_id]["session"]
+        playlist = tidal_session.playlist(playlist_id)
+
+        # Delete the playlist
+        playlist.delete()
+
+        return jsonify({"success": True, "message": "Playlist deleted successfully"})
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/tidal/merge_playlists", methods=["POST"])
+def tidal_merge_playlists():
+    """Merge two Tidal playlists into one."""
+    data = request.get_json()
+    session_id = data.get("session_id")
+    source_playlist_id = data.get("source_playlist_id")  # Playlist to merge FROM (will be deleted)
+    target_playlist_id = data.get("target_playlist_id")  # Playlist to merge INTO (will keep)
+
+    if not session_id or session_id not in tidal_sessions:
+        return jsonify({"error": "Invalid session"}), 400
+    if not source_playlist_id or not target_playlist_id:
+        return jsonify({"error": "Both source and target playlist IDs required"}), 400
+    if source_playlist_id == target_playlist_id:
+        return jsonify({"error": "Cannot merge a playlist with itself"}), 400
+
+    try:
+        tidal_session = tidal_sessions[session_id]["session"]
+
+        # Get both playlists
+        source_playlist = tidal_session.playlist(source_playlist_id)
+        target_playlist = tidal_session.playlist(target_playlist_id)
+
+        # Get tracks from source playlist
+        source_tracks = source_playlist.tracks()
+
+        # Get existing track IDs in target to avoid duplicates
+        target_tracks = target_playlist.tracks()
+        existing_track_ids = {str(t.id) for t in target_tracks}
+
+        # Filter out tracks that already exist in target
+        tracks_to_add = [t for t in source_tracks if str(t.id) not in existing_track_ids]
+
+        # Add tracks to target playlist
+        added_count = 0
+        for track in tracks_to_add:
+            try:
+                target_playlist.add([track.id])
+                added_count += 1
+            except Exception as e:
+                print(f"Failed to add track {track.id}: {e}")
+
+        # Delete the source playlist
+        source_playlist.delete()
+
+        return jsonify({
+            "success": True,
+            "message": f"Merged {added_count} tracks into target playlist",
+            "tracks_added": added_count,
+            "tracks_skipped": len(source_tracks) - added_count,
+            "source_deleted": True
+        })
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/tidal/search", methods=["POST"])
