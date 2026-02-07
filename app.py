@@ -263,6 +263,48 @@ def recently_played():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/liked_songs", methods=["POST", "OPTIONS"])
+def liked_songs():
+    if request.method == "OPTIONS":
+        return "", 200
+    """Get user's liked/saved songs from Spotify."""
+    data = request.get_json()
+    code = data.get("code")
+    limit = data.get("limit", 50)
+    offset = data.get("offset", 0)
+
+    if not code:
+        return jsonify({"error": "Authorization code required"}), 400
+
+    try:
+        sp, _ = get_spotify_client(code)
+        results = sp.current_user_saved_tracks(limit=limit, offset=offset)
+
+        tracks = []
+        for item in results["items"]:
+            track = item["track"]
+            tracks.append({
+                "id": track["id"],
+                "name": track["name"],
+                "artist": ", ".join([artist["name"] for artist in track["artists"]]),
+                "artists": [artist["name"] for artist in track["artists"]],
+                "album": track["album"]["name"],
+                "duration_ms": track["duration_ms"],
+                "image": track["album"]["images"][0]["url"] if track["album"].get("images") else None,
+                "added_at": item["added_at"]
+            })
+
+        return jsonify({
+            "tracks": tracks,
+            "total": results.get("total", 0),
+            "limit": limit,
+            "offset": offset,
+            "has_more": results.get("next") is not None
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/library_stats", methods=["POST"])
 def library_stats():
     data = request.get_json()
@@ -635,6 +677,85 @@ def tidal_create_playlist():
             "playlist_id": playlist.id,
             "name": playlist.name,
             "tracks_added": len(track_ids)
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/migrate_tracks", methods=["POST", "OPTIONS"])
+def migrate_tracks():
+    if request.method == "OPTIONS":
+        return "", 200
+    """Migrate selected tracks from Spotify to Tidal."""
+    data = request.get_json()
+    spotify_code = data.get("spotify_code")
+    tidal_session_id = data.get("tidal_session_id")
+    tracks = data.get("tracks", [])  # List of {name, artist, album} objects
+    playlist_name = data.get("playlist_name", "Migrated Songs")
+    target_playlist_id = data.get("target_playlist_id")  # Existing playlist ID (optional)
+    add_to_favorites = data.get("add_to_favorites", False)  # Add to Tidal favorites
+
+    if not spotify_code:
+        return jsonify({"error": "Spotify authorization required"}), 400
+    if not tidal_session_id or tidal_session_id not in tidal_sessions:
+        return jsonify({"error": "Tidal authorization required"}), 400
+    if not tracks:
+        return jsonify({"error": "No tracks provided"}), 400
+
+    try:
+        tidal_session = tidal_sessions[tidal_session_id]["session"]
+
+        # Search for tracks on Tidal and collect IDs
+        tidal_track_ids = []
+        not_found = []
+
+        for track in tracks:
+            query = f"{track['name']} {track['artist']}"
+            try:
+                results = tidal_session.search(query, models=[tidalapi.media.Track], limit=1)
+                found_tracks = results.get("tracks", [])
+                if found_tracks:
+                    tidal_track_ids.append(found_tracks[0].id)
+                else:
+                    not_found.append(track)
+            except:
+                not_found.append(track)
+
+        result_playlist_name = ""
+        result_playlist_id = None
+
+        if add_to_favorites:
+            # Add tracks to Tidal favorites/collection
+            for track_id in tidal_track_ids:
+                try:
+                    tidal_session.user.favorites.add_track(track_id)
+                except Exception as e:
+                    print(f"Failed to add track {track_id} to favorites: {e}")
+            result_playlist_name = "Favorites"
+        elif target_playlist_id:
+            # Add to existing playlist
+            playlist = tidal_session.playlist(target_playlist_id)
+            if tidal_track_ids:
+                playlist.add(tidal_track_ids)
+            result_playlist_name = playlist.name
+            result_playlist_id = playlist.id
+        else:
+            # Create new playlist on Tidal
+            description = f"Migrated from Spotify"
+            playlist = tidal_session.user.create_playlist(playlist_name, description)
+            if tidal_track_ids:
+                playlist.add(tidal_track_ids)
+            result_playlist_name = playlist.name
+            result_playlist_id = playlist.id
+
+        return jsonify({
+            "success": True,
+            "playlist_id": result_playlist_id,
+            "playlist_name": result_playlist_name,
+            "total_tracks": len(tracks),
+            "migrated": len(tidal_track_ids),
+            "not_found": len(not_found),
+            "not_found_tracks": not_found[:10]  # Return first 10 not found for reference
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
