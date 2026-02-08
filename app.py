@@ -70,6 +70,112 @@ def db_stats():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+
+# ==================== USER MANAGEMENT ENDPOINTS ====================
+
+@app.route("/user/me", methods=["POST"])
+def user_me():
+    """Register or get current user from Spotify auth code."""
+    data = request.get_json()
+    code = data.get("code")
+
+    if not code:
+        return jsonify({"error": "Authorization code required"}), 400
+
+    try:
+        sp, _ = get_spotify_client(code)
+        spotify_user = sp.current_user()
+
+        # Get or create user in database
+        user, is_new = get_or_create_user(
+            spotify_user_id=spotify_user["id"],
+            email=spotify_user.get("email"),
+            display_name=spotify_user.get("display_name", spotify_user["id"]),
+            avatar_url=spotify_user["images"][0]["url"] if spotify_user.get("images") else None
+        )
+
+        # Log login activity
+        log_activity(
+            user_id=user.id,
+            action="login",
+            details={"provider": "spotify", "spotify_id": spotify_user["id"]}
+        )
+
+        # Get usage stats for today
+        from datetime import date
+        today = date.today()
+        usage = ApiUsage.query.filter_by(
+            user_id=user.id,
+            action='migration',
+            window_start=today
+        ).first()
+        migrations_today = usage.count if usage else 0
+        rate_limit = app.config.get('RATE_LIMIT_MIGRATIONS', 50)
+
+        return jsonify({
+            "id": user.id,
+            "email": user.email,
+            "display_name": user.display_name,
+            "avatar_url": user.avatar_url,
+            "tier": user.tier,
+            "created_at": user.created_at.isoformat() if user.created_at else None,
+            "migrations_today": migrations_today,
+            "migrations_remaining": max(0, rate_limit - migrations_today),
+            "rate_limit": rate_limit
+        })
+    except Exception as e:
+        print(f"[USER] Error in user_me: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/user/history", methods=["POST"])
+def user_history():
+    """Get user's migration history."""
+    data = request.get_json()
+    code = data.get("code")
+    limit = data.get("limit", 20)
+
+    if not code:
+        return jsonify({"error": "Authorization code required"}), 400
+
+    try:
+        sp, _ = get_spotify_client(code)
+        spotify_user = sp.current_user()
+
+        # Find user by Spotify identity
+        identity = UserIdentity.query.filter_by(
+            provider="spotify",
+            provider_id=spotify_user["id"]
+        ).first()
+
+        if not identity:
+            return jsonify([])  # No user found, return empty history
+
+        # Get migrations for this user
+        migrations = Migration.query.filter_by(user_id=identity.user_id)\
+            .order_by(Migration.created_at.desc())\
+            .limit(limit)\
+            .all()
+
+        return jsonify([{
+            "id": m.id,
+            "source_provider": m.source_provider,
+            "target_provider": m.target_provider,
+            "source_playlist_name": m.source_playlist_name,
+            "target_playlist_name": m.target_playlist_name,
+            "migration_type": m.migration_type,
+            "total_tracks": m.total_tracks,
+            "migrated_tracks": m.migrated_tracks,
+            "skipped_tracks": m.skipped_tracks,
+            "status": m.status,
+            "created_at": m.created_at.isoformat() if m.created_at else None,
+            "completed_at": m.completed_at.isoformat() if m.completed_at else None
+        } for m in migrations])
+    except Exception as e:
+        print(f"[USER] Error in user_history: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
 # Extended scopes for dashboard insights
 SCOPE = "playlist-read-private playlist-read-collaborative user-top-read user-read-recently-played user-library-read user-read-private user-follow-read"
 
