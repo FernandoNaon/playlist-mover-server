@@ -1,0 +1,35 @@
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Environment files
+.env
+.env.local
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.vscode/
+.idea/
+
+# Cache files
+.cache
+*.sqlite
+*.db
+
+# Docker
+docker-compose.yml
+Dockerfile
+
+# Documentation
+*.md
+!requirements.txt

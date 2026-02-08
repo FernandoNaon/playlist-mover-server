@@ -4,3 +4,10 @@ python-dotenv
 spotipy
 tidalapi
 gunicorn
+# Database
+sqlalchemy
+psycopg2-binary
+flask-sqlalchemy
+flask-migrate
+# Security
+cryptography

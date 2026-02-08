@@ -1,0 +1,46 @@
+# Docker Compose for local development
+# Run: docker-compose up -d
+services:
+  # PostgreSQL Database
+  db:
+    image: postgres:15-alpine
+    container_name: migrate_beats_db
+    environment:
+      POSTGRES_USER: migrate_beats
+      POSTGRES_PASSWORD: localdevpassword
+      POSTGRES_DB: migrate_beats
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U migrate_beats"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Flask API Server
+  api:
+    build: .
+    container_name: migrate_beats_api
+    ports:
+      - "5000:5000"
+    env_file:
+      - .env
+    environment:
+      - DATABASE_URL=postgresql://migrate_beats:localdevpassword@db:5432/migrate_beats
+      - FLASK_ENV=development
+      - FLASK_DEBUG=1
+      - SPOTIPY_REDIRECT_URI=http://127.0.0.1:5000/callback
+      - FRONTEND_URL=http://localhost:5173
+      - FRONTEND_REDIRECT=http://localhost:5173/callback
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      # Mount source code for hot reload in development
+      - .:/app
+    command: ["flask", "run", "--host=0.0.0.0", "--port=5000", "--reload"]
+
+volumes:
+  postgres_data:
