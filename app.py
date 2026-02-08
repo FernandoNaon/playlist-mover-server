@@ -824,6 +824,327 @@ def tidal_create_playlist():
         return jsonify({"error": str(e)}), 500
 
 
+# ==================== TIDAL LIKED SONGS ====================
+
+@app.route("/tidal/liked_songs", methods=["POST", "OPTIONS"])
+def tidal_liked_songs():
+    if request.method == "OPTIONS":
+        return "", 200
+    """Get user's liked/favorite tracks from Tidal."""
+    data = request.get_json()
+    session_id = data.get("session_id")
+    limit = data.get("limit", 50)
+    offset = data.get("offset", 0)
+
+    if not session_id or session_id not in tidal_sessions:
+        return jsonify({"error": "Invalid session"}), 400
+
+    try:
+        tidal_session = tidal_sessions[session_id]["session"]
+
+        # Get user's favorite tracks
+        favorites = tidal_session.user.favorites
+        favorite_tracks = favorites.tracks(limit=limit, offset=offset)
+
+        tracks = []
+        for track in favorite_tracks:
+            tracks.append({
+                "id": str(track.id),
+                "name": track.name,
+                "artist": track.artist.name if track.artist else "Unknown",
+                "artists": [track.artist.name] if track.artist else [],
+                "album": track.album.name if track.album else "Unknown",
+                "duration_ms": (track.duration or 0) * 1000,  # Tidal uses seconds
+                "image": track.album.image(320) if track.album else None,
+                "added_at": track.user_date_added.isoformat() if hasattr(track, 'user_date_added') and track.user_date_added else None
+            })
+
+        # Try to get total count
+        total = len(favorite_tracks)  # Fallback
+        has_more = len(favorite_tracks) == limit
+
+        return jsonify({
+            "tracks": tracks,
+            "total": total,
+            "has_more": has_more
+        })
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
+# ==================== TIDAL TO SPOTIFY MIGRATION ====================
+
+@app.route("/migrate_tidal_to_spotify", methods=["POST", "OPTIONS"])
+def migrate_tidal_to_spotify():
+    if request.method == "OPTIONS":
+        return "", 200
+    """Migrate a Tidal playlist to Spotify."""
+    data = request.get_json()
+    spotify_code = data.get("spotify_code")
+    tidal_session_id = data.get("tidal_session_id")
+    playlist_id = data.get("playlist_id")
+    playlist_name = data.get("playlist_name")
+
+    if not spotify_code:
+        return jsonify({"error": "Spotify authorization required"}), 400
+    if not tidal_session_id or tidal_session_id not in tidal_sessions:
+        return jsonify({"error": "Tidal authorization required"}), 400
+    if not playlist_id:
+        return jsonify({"error": "Playlist ID required"}), 400
+
+    # Get user for tracking
+    user_id = None
+
+    try:
+        # Get clients
+        sp, _ = get_spotify_client(spotify_code)
+        tidal_session = tidal_sessions[tidal_session_id]["session"]
+
+        # Get user ID for tracking
+        try:
+            spotify_user = sp.current_user()
+            identity = UserIdentity.query.filter_by(
+                provider='spotify',
+                provider_user_id=spotify_user["id"]
+            ).first()
+            if identity:
+                user_id = identity.user_id
+        except Exception as e:
+            print(f"[MIGRATE] Could not identify user: {e}")
+
+        # Fetch all tracks from Tidal playlist
+        tidal_playlist = tidal_session.playlist(playlist_id)
+        tidal_tracks = tidal_playlist.tracks()
+
+        source_tracks = []
+        for track in tidal_tracks:
+            source_tracks.append({
+                "name": track.name,
+                "artist": track.artist.name if track.artist else "",
+                "album": track.album.name if track.album else ""
+            })
+
+        # Search for tracks on Spotify and collect URIs
+        spotify_uris = []
+        not_found = []
+
+        for track in source_tracks:
+            query = f"track:{track['name']} artist:{track['artist']}"
+            try:
+                results = sp.search(q=query, type='track', limit=1)
+                found_tracks = results.get("tracks", {}).get("items", [])
+                if found_tracks:
+                    spotify_uris.append(found_tracks[0]["uri"])
+                else:
+                    # Try simpler search
+                    simple_query = f"{track['name']} {track['artist']}"
+                    results = sp.search(q=simple_query, type='track', limit=1)
+                    found_tracks = results.get("tracks", {}).get("items", [])
+                    if found_tracks:
+                        spotify_uris.append(found_tracks[0]["uri"])
+                    else:
+                        not_found.append(track)
+            except:
+                not_found.append(track)
+
+        # Create playlist on Spotify
+        spotify_user = sp.current_user()
+        new_playlist = sp.user_playlist_create(
+            spotify_user["id"],
+            playlist_name or tidal_playlist.name or "Migrated from Tidal",
+            public=False,
+            description="Migrated from Tidal"
+        )
+
+        # Add tracks to playlist (Spotify allows max 100 per request)
+        if spotify_uris:
+            for i in range(0, len(spotify_uris), 100):
+                batch = spotify_uris[i:i+100]
+                sp.playlist_add_items(new_playlist["id"], batch)
+
+        # Track migration in database
+        if user_id:
+            try:
+                from datetime import datetime
+                migration = Migration(
+                    user_id=user_id,
+                    source_provider='tidal',
+                    target_provider='spotify',
+                    source_playlist_id=playlist_id,
+                    source_playlist_name=tidal_playlist.name,
+                    target_playlist_id=new_playlist["id"],
+                    target_playlist_name=new_playlist["name"],
+                    migration_type='playlist',
+                    total_tracks=len(source_tracks),
+                    migrated_tracks=len(spotify_uris),
+                    skipped_tracks=len(not_found),
+                    not_found_tracks=not_found[:10],
+                    status='completed',
+                    completed_at=datetime.utcnow()
+                )
+                db.session.add(migration)
+                increment_usage(user_id, 'migration', len(spotify_uris))
+                db.session.commit()
+                print(f"[MIGRATE] Tracked Tidal->Spotify migration for user {user_id}: {len(spotify_uris)} tracks")
+            except Exception as e:
+                print(f"[MIGRATE] Failed to track migration: {e}")
+
+        return jsonify({
+            "success": True,
+            "playlist_id": new_playlist["id"],
+            "playlist_name": new_playlist["name"],
+            "total_tracks": len(source_tracks),
+            "migrated": len(spotify_uris),
+            "not_found": len(not_found),
+            "not_found_tracks": not_found[:10]
+        })
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/migrate_tidal_tracks", methods=["POST", "OPTIONS"])
+def migrate_tidal_tracks():
+    if request.method == "OPTIONS":
+        return "", 200
+    """Migrate selected tracks from Tidal to Spotify."""
+    data = request.get_json()
+    spotify_code = data.get("spotify_code")
+    tidal_session_id = data.get("tidal_session_id")
+    tracks = data.get("tracks", [])  # List of {name, artist, album} objects
+    playlist_name = data.get("playlist_name", "Migrated from Tidal")
+    target_playlist_id = data.get("target_playlist_id")  # Existing Spotify playlist ID
+    add_to_liked = data.get("add_to_liked", False)  # Add to Spotify liked songs
+
+    if not spotify_code:
+        return jsonify({"error": "Spotify authorization required"}), 400
+    if not tidal_session_id or tidal_session_id not in tidal_sessions:
+        return jsonify({"error": "Tidal authorization required"}), 400
+    if not tracks:
+        return jsonify({"error": "No tracks provided"}), 400
+
+    # Get user for tracking
+    user_id = None
+    try:
+        sp, _ = get_spotify_client(spotify_code)
+        spotify_user = sp.current_user()
+        identity = UserIdentity.query.filter_by(
+            provider='spotify',
+            provider_user_id=spotify_user["id"]
+        ).first()
+        if identity:
+            user_id = identity.user_id
+    except Exception as e:
+        print(f"[MIGRATE] Could not identify user: {e}")
+
+    try:
+        sp, _ = get_spotify_client(spotify_code)
+
+        # Search for tracks on Spotify
+        spotify_uris = []
+        spotify_ids = []
+        not_found = []
+
+        for track in tracks:
+            query = f"track:{track['name']} artist:{track['artist']}"
+            try:
+                results = sp.search(q=query, type='track', limit=1)
+                found_tracks = results.get("tracks", {}).get("items", [])
+                if found_tracks:
+                    spotify_uris.append(found_tracks[0]["uri"])
+                    spotify_ids.append(found_tracks[0]["id"])
+                else:
+                    # Try simpler search
+                    simple_query = f"{track['name']} {track['artist']}"
+                    results = sp.search(q=simple_query, type='track', limit=1)
+                    found_tracks = results.get("tracks", {}).get("items", [])
+                    if found_tracks:
+                        spotify_uris.append(found_tracks[0]["uri"])
+                        spotify_ids.append(found_tracks[0]["id"])
+                    else:
+                        not_found.append(track)
+            except:
+                not_found.append(track)
+
+        result_playlist_name = ""
+        result_playlist_id = None
+
+        if add_to_liked:
+            # Add tracks to Spotify liked songs
+            if spotify_ids:
+                for i in range(0, len(spotify_ids), 50):
+                    batch = spotify_ids[i:i+50]
+                    sp.current_user_saved_tracks_add(batch)
+            result_playlist_name = "Liked Songs"
+        elif target_playlist_id:
+            # Add to existing Spotify playlist
+            if spotify_uris:
+                for i in range(0, len(spotify_uris), 100):
+                    batch = spotify_uris[i:i+100]
+                    sp.playlist_add_items(target_playlist_id, batch)
+            # Get playlist name
+            playlist = sp.playlist(target_playlist_id)
+            result_playlist_name = playlist["name"]
+            result_playlist_id = target_playlist_id
+        else:
+            # Create new playlist on Spotify
+            spotify_user = sp.current_user()
+            new_playlist = sp.user_playlist_create(
+                spotify_user["id"],
+                playlist_name,
+                public=False,
+                description="Migrated from Tidal"
+            )
+            if spotify_uris:
+                for i in range(0, len(spotify_uris), 100):
+                    batch = spotify_uris[i:i+100]
+                    sp.playlist_add_items(new_playlist["id"], batch)
+            result_playlist_name = new_playlist["name"]
+            result_playlist_id = new_playlist["id"]
+
+        # Track migration in database
+        if user_id:
+            try:
+                from datetime import datetime
+                migration = Migration(
+                    user_id=user_id,
+                    source_provider='tidal',
+                    target_provider='spotify',
+                    source_playlist_name='Selected Tracks',
+                    target_playlist_name=result_playlist_name,
+                    migration_type='tracks' if not add_to_liked else 'liked',
+                    total_tracks=len(tracks),
+                    migrated_tracks=len(spotify_uris),
+                    skipped_tracks=len(not_found),
+                    not_found_tracks=not_found[:10],
+                    status='completed',
+                    completed_at=datetime.utcnow()
+                )
+                db.session.add(migration)
+                increment_usage(user_id, 'migration', len(spotify_uris))
+                db.session.commit()
+                print(f"[MIGRATE] Tracked Tidal->Spotify tracks migration for user {user_id}: {len(spotify_uris)} tracks")
+            except Exception as e:
+                print(f"[MIGRATE] Failed to track migration: {e}")
+
+        return jsonify({
+            "success": True,
+            "playlist_id": result_playlist_id,
+            "playlist_name": result_playlist_name,
+            "total_tracks": len(tracks),
+            "migrated": len(spotify_uris),
+            "not_found": len(not_found),
+            "not_found_tracks": not_found[:10]
+        })
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/migrate_tracks", methods=["POST", "OPTIONS"])
 def migrate_tracks():
     if request.method == "OPTIONS":
