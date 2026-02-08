@@ -25,17 +25,15 @@ services:
     container_name: migrate_beats_api
     ports:
       - "5000:5000"
+    env_file:
+      - .env
     environment:
       - DATABASE_URL=postgresql://migrate_beats:localdevpassword@db:5432/migrate_beats
       - FLASK_ENV=development
       - FLASK_DEBUG=1
-      # These should be in .env file
-      - SPOTIPY_CLIENT_ID=${SPOTIPY_CLIENT_ID}
-      - SPOTIPY_CLIENT_SECRET=${SPOTIPY_CLIENT_SECRET}
       - SPOTIPY_REDIRECT_URI=http://127.0.0.1:5000/callback
       - FRONTEND_URL=http://localhost:5173
       - FRONTEND_REDIRECT=http://localhost:5173/callback
-      - FLASK_SECRET_KEY=${FLASK_SECRET_KEY:-supersecretkey}
     depends_on:
       db:
         condition: service_healthy
