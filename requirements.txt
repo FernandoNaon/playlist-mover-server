@@ -4,3 +4,6 @@ python-dotenv
 spotipy
 tidalapi
 gunicorn
+flask-sqlalchemy
+psycopg2-binary
+sqlalchemy
