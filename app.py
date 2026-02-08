@@ -8,7 +8,18 @@ import tidalapi
 
 load_dotenv()
 
+# Import database
+from config import get_config
+from models import db, User, UserIdentity, UserActivity, Migration, ApiUsage
+from models import get_or_create_user, log_activity, check_rate_limit, increment_usage
+
 app = Flask(__name__)
+
+# Load configuration (includes DATABASE_URL)
+app.config.from_object(get_config())
+
+# Initialize database
+db.init_app(app)
 
 # CORS Configuration - support both local and production
 FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://localhost:5173")
@@ -29,6 +40,35 @@ TIDAL_CLIENT_ID = os.environ.get("TIDAL_CLIENT_ID")
 TIDAL_CLIENT_SECRET = os.environ.get("TIDAL_CLIENT_SECRET")
 
 FRONTEND_REDIRECT = os.environ.get("FRONTEND_REDIRECT", "http://localhost:5173/callback")
+
+# Store Tidal sessions in memory
+tidal_sessions = {}
+
+
+# ==================== DATABASE ENDPOINTS ====================
+
+@app.route("/db/health", methods=["GET"])
+def db_health():
+    """Check database health."""
+    try:
+        db.session.execute(db.text('SELECT 1'))
+        return jsonify({"status": "healthy", "database": "connected"})
+    except Exception as e:
+        return jsonify({"status": "unhealthy", "error": str(e)}), 500
+
+
+@app.route("/db/stats", methods=["GET"])
+def db_stats():
+    """Get database statistics."""
+    try:
+        stats = {
+            "users": User.query.count(),
+            "migrations": Migration.query.count(),
+            "activities": UserActivity.query.count(),
+        }
+        return jsonify(stats)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 # Extended scopes for dashboard insights
 SCOPE = "playlist-read-private playlist-read-collaborative user-top-read user-read-recently-played user-library-read user-read-private user-follow-read"
@@ -355,10 +395,6 @@ def library_stats():
 
 
 # ==================== TIDAL INTEGRATION ====================
-
-# Store Tidal sessions in memory (in production, use Redis or database)
-tidal_sessions = {}
-
 
 @app.route("/tidal/login", methods=["POST"])
 def tidal_login():
@@ -835,6 +871,15 @@ def migrate_playlist():
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+# Create database tables on startup
+with app.app_context():
+    try:
+        db.create_all()
+        print("[DB] Database tables created successfully")
+    except Exception as e:
+        print(f"[DB] Warning: Could not create tables: {e}")
 
 
 if __name__ == "__main__":
