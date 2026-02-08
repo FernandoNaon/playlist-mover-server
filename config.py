@@ -30,7 +30,7 @@ class Config:
     FRONTEND_URL = os.environ.get('FRONTEND_URL', 'http://localhost:5173')
 
     # Rate Limits (per day)
-    RATE_LIMIT_MIGRATIONS = int(os.environ.get('RATE_LIMIT_MIGRATIONS', 50))
+    RATE_LIMIT_MIGRATIONS = int(os.environ.get('RATE_LIMIT_MIGRATIONS', 25))
 
 
 def get_config():

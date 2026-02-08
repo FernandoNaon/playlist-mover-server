@@ -844,6 +844,20 @@ def migrate_tracks():
     if not tracks:
         return jsonify({"error": "No tracks provided"}), 400
 
+    # Get user for tracking
+    user_id = None
+    try:
+        sp, _ = get_spotify_client(spotify_code)
+        spotify_user = sp.current_user()
+        identity = UserIdentity.query.filter_by(
+            provider='spotify',
+            provider_user_id=spotify_user["id"]
+        ).first()
+        if identity:
+            user_id = identity.user_id
+    except Exception as e:
+        print(f"[MIGRATE] Could not identify user: {e}")
+
     try:
         tidal_session = tidal_sessions[tidal_session_id]["session"]
 
@@ -890,6 +904,34 @@ def migrate_tracks():
             result_playlist_name = playlist.name
             result_playlist_id = playlist.id
 
+        # Track migration in database
+        if user_id:
+            try:
+                from datetime import datetime
+                migration = Migration(
+                    user_id=user_id,
+                    source_provider='spotify',
+                    target_provider='tidal',
+                    source_playlist_name='Selected Tracks',
+                    target_playlist_name=result_playlist_name,
+                    migration_type='tracks' if not add_to_favorites else 'favorites',
+                    total_tracks=len(tracks),
+                    migrated_tracks=len(tidal_track_ids),
+                    skipped_tracks=len(not_found),
+                    not_found_tracks=not_found[:10],
+                    status='completed',
+                    completed_at=datetime.utcnow()
+                )
+                db.session.add(migration)
+
+                # Increment usage counter
+                increment_usage(user_id, 'migration', len(tidal_track_ids))
+
+                db.session.commit()
+                print(f"[MIGRATE] Tracked migration for user {user_id}: {len(tidal_track_ids)} tracks")
+            except Exception as e:
+                print(f"[MIGRATE] Failed to track migration: {e}")
+
         return jsonify({
             "success": True,
             "playlist_id": result_playlist_id,
@@ -919,10 +961,25 @@ def migrate_playlist():
     if not playlist_id:
         return jsonify({"error": "Playlist ID required"}), 400
 
+    # Get user for tracking
+    user_id = None
+
     try:
         # Get Spotify tracks
         sp, _ = get_spotify_client(spotify_code)
         tidal_session = tidal_sessions[tidal_session_id]["session"]
+
+        # Get user ID for tracking
+        try:
+            spotify_user = sp.current_user()
+            identity = UserIdentity.query.filter_by(
+                provider='spotify',
+                provider_user_id=spotify_user["id"]
+            ).first()
+            if identity:
+                user_id = identity.user_id
+        except Exception as e:
+            print(f"[MIGRATE] Could not identify user: {e}")
 
         # Fetch all tracks from Spotify playlist
         spotify_tracks = []
@@ -965,6 +1022,36 @@ def migrate_playlist():
         # Add tracks to playlist
         if tidal_track_ids:
             playlist.add(tidal_track_ids)
+
+        # Track migration in database
+        if user_id:
+            try:
+                from datetime import datetime
+                migration = Migration(
+                    user_id=user_id,
+                    source_provider='spotify',
+                    target_provider='tidal',
+                    source_playlist_id=playlist_id,
+                    source_playlist_name=playlist_name,
+                    target_playlist_id=str(playlist.id),
+                    target_playlist_name=playlist.name,
+                    migration_type='playlist',
+                    total_tracks=len(spotify_tracks),
+                    migrated_tracks=len(tidal_track_ids),
+                    skipped_tracks=len(not_found),
+                    not_found_tracks=not_found[:10],
+                    status='completed',
+                    completed_at=datetime.utcnow()
+                )
+                db.session.add(migration)
+
+                # Increment usage counter
+                increment_usage(user_id, 'migration', len(tidal_track_ids))
+
+                db.session.commit()
+                print(f"[MIGRATE] Tracked playlist migration for user {user_id}: {len(tidal_track_ids)} tracks")
+            except Exception as e:
+                print(f"[MIGRATE] Failed to track migration: {e}")
 
         return jsonify({
             "success": True,
