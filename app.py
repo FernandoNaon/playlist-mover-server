@@ -1,37 +1,55 @@
 from flask import Flask, request, redirect, session, jsonify
 from flask_cors import CORS
+from flask_migrate import Migrate
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
 from dotenv import load_dotenv
 import os
 import tidalapi
+from datetime import datetime
 
 load_dotenv()
 
+# Import database and config
+from config import get_config
+from models import (
+    db, User, UserIdentity, AuthToken, UserSession, UserActivity,
+    SpotifyCache, Migration, ApiUsage,
+    get_or_create_user, log_activity, check_rate_limit, increment_usage
+)
+
 app = Flask(__name__)
 
+# Load configuration
+app.config.from_object(get_config())
+
+# Initialize database
+db.init_app(app)
+migrate = Migrate(app, db)
+
 # CORS Configuration - support both local and production
-FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://localhost:5173")
+FRONTEND_URL = app.config.get('FRONTEND_URL', 'http://localhost:5173')
 CORS(app,
      supports_credentials=True,
      origins=[FRONTEND_URL, "http://localhost:5173", "http://127.0.0.1:5173"],
      allow_headers=["Content-Type", "Authorization"],
      methods=["GET", "POST", "OPTIONS"])
-app.secret_key = os.environ.get("FLASK_SECRET_KEY", "supersecretkey")
 
 # Spotify Configuration
-SPOTIPY_CLIENT_ID = os.environ.get("SPOTIPY_CLIENT_ID")
-SPOTIPY_CLIENT_SECRET = os.environ.get("SPOTIPY_CLIENT_SECRET")
-SPOTIPY_REDIRECT_URI = os.environ.get("SPOTIPY_REDIRECT_URI", "http://127.0.0.1:5000/callback")
+SPOTIPY_CLIENT_ID = app.config.get('SPOTIPY_CLIENT_ID')
+SPOTIPY_CLIENT_SECRET = app.config.get('SPOTIPY_CLIENT_SECRET')
+SPOTIPY_REDIRECT_URI = app.config.get('SPOTIPY_REDIRECT_URI', 'http://127.0.0.1:5000/callback')
 
-# Tidal Configuration
-TIDAL_CLIENT_ID = os.environ.get("TIDAL_CLIENT_ID")
-TIDAL_CLIENT_SECRET = os.environ.get("TIDAL_CLIENT_SECRET")
-
-FRONTEND_REDIRECT = os.environ.get("FRONTEND_REDIRECT", "http://localhost:5173/callback")
+FRONTEND_REDIRECT = app.config.get('FRONTEND_REDIRECT', 'http://localhost:5173/callback')
 
 # Extended scopes for dashboard insights
 SCOPE = "playlist-read-private playlist-read-collaborative user-top-read user-read-recently-played user-library-read user-read-private user-follow-read"
+
+# Store Tidal sessions in memory (in production, use Redis or database)
+tidal_sessions = {}
+
+# Store user contexts (spotify_id -> user_id mapping for current session)
+user_contexts = {}
 
 
 def get_spotify_oauth():
@@ -48,6 +66,119 @@ def get_spotify_client(code):
     sp_oauth = get_spotify_oauth()
     token_info = sp_oauth.get_access_token(code, as_dict=True)
     return spotipy.Spotify(auth=token_info['access_token']), token_info
+
+
+def get_user_from_code(code):
+    """Get or create user from Spotify auth code. Returns (user, sp_client)."""
+    try:
+        sp, token_info = get_spotify_client(code)
+        spotify_user = sp.current_user()
+
+        user, is_new = get_or_create_user(
+            spotify_user_id=spotify_user['id'],
+            email=spotify_user.get('email'),
+            display_name=spotify_user.get('display_name', spotify_user['id']),
+            avatar_url=spotify_user['images'][0]['url'] if spotify_user.get('images') else None
+        )
+
+        # Cache user context
+        user_contexts[spotify_user['id']] = user.id
+
+        if is_new:
+            log_activity(user.id, 'signup', {'provider': 'spotify'})
+        else:
+            log_activity(user.id, 'login', {'provider': 'spotify'})
+
+        return user, sp
+    except Exception as e:
+        print(f"Error getting user from code: {e}")
+        return None, None
+
+
+# ==================== DATABASE ENDPOINTS ====================
+
+@app.route("/db/health", methods=["GET"])
+def db_health():
+    """Check database health."""
+    try:
+        db.session.execute(db.text('SELECT 1'))
+        return jsonify({"status": "healthy", "database": "connected"})
+    except Exception as e:
+        return jsonify({"status": "unhealthy", "error": str(e)}), 500
+
+
+@app.route("/db/stats", methods=["GET"])
+def db_stats():
+    """Get database statistics (admin only in production)."""
+    try:
+        stats = {
+            "users": User.query.count(),
+            "migrations": Migration.query.count(),
+            "activities": UserActivity.query.count(),
+        }
+        return jsonify(stats)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/user/me", methods=["POST"])
+def get_current_user():
+    """Get current user info with usage stats."""
+    data = request.get_json()
+    code = data.get("code")
+
+    if not code:
+        return jsonify({"error": "Authorization code required"}), 400
+
+    try:
+        user, sp = get_user_from_code(code)
+        if not user:
+            return jsonify({"error": "Could not authenticate user"}), 401
+
+        # Get usage stats
+        from datetime import date
+        today = date.today()
+
+        migrations_today = ApiUsage.query.filter_by(
+            user_id=user.id,
+            action='migration',
+            window_start=today
+        ).first()
+
+        return jsonify({
+            **user.to_dict(),
+            "usage": {
+                "migrations_today": migrations_today.count if migrations_today else 0,
+                "migrations_limit": app.config.get('RATE_LIMIT_MIGRATIONS', 50),
+            }
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/user/history", methods=["POST"])
+def get_user_history():
+    """Get user's migration history."""
+    data = request.get_json()
+    code = data.get("code")
+    limit = data.get("limit", 20)
+
+    if not code:
+        return jsonify({"error": "Authorization code required"}), 400
+
+    try:
+        user, _ = get_user_from_code(code)
+        if not user:
+            return jsonify({"error": "Could not authenticate user"}), 401
+
+        migrations = Migration.query.filter_by(user_id=user.id)\
+            .order_by(Migration.created_at.desc())\
+            .limit(limit)\
+            .all()
+
+        return jsonify([m.to_dict() for m in migrations])
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 # ==================== SPOTIFY AUTH ====================
@@ -356,25 +487,16 @@ def library_stats():
 
 # ==================== TIDAL INTEGRATION ====================
 
-# Store Tidal sessions in memory (in production, use Redis or database)
-tidal_sessions = {}
-
-
 @app.route("/tidal/login", methods=["POST"])
 def tidal_login():
     """Start Tidal OAuth login flow using device authorization."""
     try:
-        # Use default tidalapi session (library's built-in credentials)
-        # Custom credentials cause 400 errors with Tidal's device auth flow
-        # The tidalapi library has its own registered client ID
         tidal_session = tidalapi.Session()
 
         print(f"[Tidal] Starting OAuth login...")
 
-        # Use login_oauth - this uses tidalapi's internal credentials
         login, future = tidal_session.login_oauth()
 
-        # Generate a unique session ID
         import uuid
         session_id = str(uuid.uuid4())
 
@@ -384,7 +506,6 @@ def tidal_login():
             "login": login
         }
 
-        # Fix URL - tidalapi returns URL without https:// prefix
         verification_url = login.verification_uri_complete
         if not verification_url.startswith("http"):
             verification_url = f"https://{verification_url}"
@@ -421,11 +542,9 @@ def tidal_check_auth():
 
         print(f"[Tidal] Checking auth - future.done(): {future.done()}")
 
-        # Check if the future is done (user completed login)
         if future.done():
             try:
-                future.result()  # This will raise if there was an error
-                # Authorization successful
+                future.result()
                 user = tidal_session.user
                 print(f"[Tidal] Auth successful! User: {user}")
                 return jsonify({
@@ -462,11 +581,10 @@ def tidal_playlists():
 
         playlists = []
         for p in user_playlists:
-            # Get image URL - image() is a method in tidalapi
             image_url = None
             try:
                 if hasattr(p, 'image') and callable(p.image):
-                    image_url = p.image(320)  # Get 320x320 image
+                    image_url = p.image(320)
                 elif hasattr(p, 'picture') and p.picture:
                     image_url = f"https://resources.tidal.com/images/{p.picture.replace('-', '/')}/320x320.jpg"
                 elif hasattr(p, 'square_picture') and p.square_picture:
@@ -508,7 +626,6 @@ def tidal_playlist_tracks():
 
         tracks = []
         for track in playlist_tracks:
-            # Get album image URL - image() is a method in tidalapi
             image_url = None
             try:
                 if track.album:
@@ -550,8 +667,6 @@ def tidal_delete_playlist():
     try:
         tidal_session = tidal_sessions[session_id]["session"]
         playlist = tidal_session.playlist(playlist_id)
-
-        # Delete the playlist
         playlist.delete()
 
         return jsonify({"success": True, "message": "Playlist deleted successfully"})
@@ -566,8 +681,8 @@ def tidal_merge_playlists():
     """Merge two Tidal playlists into one."""
     data = request.get_json()
     session_id = data.get("session_id")
-    source_playlist_id = data.get("source_playlist_id")  # Playlist to merge FROM (will be deleted)
-    target_playlist_id = data.get("target_playlist_id")  # Playlist to merge INTO (will keep)
+    source_playlist_id = data.get("source_playlist_id")
+    target_playlist_id = data.get("target_playlist_id")
 
     if not session_id or session_id not in tidal_sessions:
         return jsonify({"error": "Invalid session"}), 400
@@ -579,21 +694,15 @@ def tidal_merge_playlists():
     try:
         tidal_session = tidal_sessions[session_id]["session"]
 
-        # Get both playlists
         source_playlist = tidal_session.playlist(source_playlist_id)
         target_playlist = tidal_session.playlist(target_playlist_id)
 
-        # Get tracks from source playlist
         source_tracks = source_playlist.tracks()
-
-        # Get existing track IDs in target to avoid duplicates
         target_tracks = target_playlist.tracks()
         existing_track_ids = {str(t.id) for t in target_tracks}
 
-        # Filter out tracks that already exist in target
         tracks_to_add = [t for t in source_tracks if str(t.id) not in existing_track_ids]
 
-        # Add tracks to target playlist
         added_count = 0
         for track in tracks_to_add:
             try:
@@ -602,7 +711,6 @@ def tidal_merge_playlists():
             except Exception as e:
                 print(f"Failed to add track {track.id}: {e}")
 
-        # Delete the source playlist
         source_playlist.delete()
 
         return jsonify({
@@ -664,11 +772,8 @@ def tidal_create_playlist():
 
     try:
         tidal_session = tidal_sessions[session_id]["session"]
-
-        # Create playlist
         playlist = tidal_session.user.create_playlist(name, description)
 
-        # Add tracks if provided
         if track_ids:
             playlist.add(track_ids)
 
@@ -690,10 +795,10 @@ def migrate_tracks():
     data = request.get_json()
     spotify_code = data.get("spotify_code")
     tidal_session_id = data.get("tidal_session_id")
-    tracks = data.get("tracks", [])  # List of {name, artist, album} objects
+    tracks = data.get("tracks", [])
     playlist_name = data.get("playlist_name", "Migrated Songs")
-    target_playlist_id = data.get("target_playlist_id")  # Existing playlist ID (optional)
-    add_to_favorites = data.get("add_to_favorites", False)  # Add to Tidal favorites
+    target_playlist_id = data.get("target_playlist_id")
+    add_to_favorites = data.get("add_to_favorites", False)
 
     if not spotify_code:
         return jsonify({"error": "Spotify authorization required"}), 400
@@ -701,6 +806,24 @@ def migrate_tracks():
         return jsonify({"error": "Tidal authorization required"}), 400
     if not tracks:
         return jsonify({"error": "No tracks provided"}), 400
+
+    # Get user for tracking
+    user = None
+    try:
+        user, _ = get_user_from_code(spotify_code)
+        if user:
+            # Check rate limit
+            allowed, remaining = check_rate_limit(
+                user.id, 'migration',
+                app.config.get('RATE_LIMIT_MIGRATIONS', 50)
+            )
+            if not allowed:
+                return jsonify({
+                    "error": "Daily migration limit reached",
+                    "limit": app.config.get('RATE_LIMIT_MIGRATIONS', 50)
+                }), 429
+    except Exception as e:
+        print(f"Error getting user for migration tracking: {e}")
 
     try:
         tidal_session = tidal_sessions[tidal_session_id]["session"]
@@ -723,30 +846,64 @@ def migrate_tracks():
 
         result_playlist_name = ""
         result_playlist_id = None
+        migration_type = "custom"
 
         if add_to_favorites:
-            # Add tracks to Tidal favorites/collection
             for track_id in tidal_track_ids:
                 try:
                     tidal_session.user.favorites.add_track(track_id)
                 except Exception as e:
                     print(f"Failed to add track {track_id} to favorites: {e}")
             result_playlist_name = "Favorites"
+            migration_type = "favorites"
         elif target_playlist_id:
-            # Add to existing playlist
             playlist = tidal_session.playlist(target_playlist_id)
             if tidal_track_ids:
                 playlist.add(tidal_track_ids)
             result_playlist_name = playlist.name
             result_playlist_id = playlist.id
+            migration_type = "existing_playlist"
         else:
-            # Create new playlist on Tidal
             description = f"Migrated from Spotify"
             playlist = tidal_session.user.create_playlist(playlist_name, description)
             if tidal_track_ids:
                 playlist.add(tidal_track_ids)
             result_playlist_name = playlist.name
             result_playlist_id = playlist.id
+            migration_type = "new_playlist"
+
+        # Log migration to database
+        if user:
+            try:
+                migration = Migration(
+                    user_id=user.id,
+                    source_provider='spotify',
+                    target_provider='tidal',
+                    target_playlist_id=result_playlist_id,
+                    target_playlist_name=result_playlist_name,
+                    migration_type=migration_type,
+                    total_tracks=len(tracks),
+                    migrated_tracks=len(tidal_track_ids),
+                    skipped_tracks=len(not_found),
+                    not_found_tracks=not_found[:10],
+                    status='completed',
+                    completed_at=datetime.utcnow()
+                )
+                db.session.add(migration)
+                db.session.commit()
+
+                # Update usage counter
+                increment_usage(user.id, 'migration', len(tracks))
+
+                log_activity(user.id, 'migration', {
+                    'type': migration_type,
+                    'total': len(tracks),
+                    'migrated': len(tidal_track_ids),
+                    'not_found': len(not_found)
+                })
+            except Exception as e:
+                print(f"Error logging migration: {e}")
+                db.session.rollback()
 
         return jsonify({
             "success": True,
@@ -755,9 +912,25 @@ def migrate_tracks():
             "total_tracks": len(tracks),
             "migrated": len(tidal_track_ids),
             "not_found": len(not_found),
-            "not_found_tracks": not_found[:10]  # Return first 10 not found for reference
+            "not_found_tracks": not_found[:10]
         })
     except Exception as e:
+        # Log failed migration
+        if user:
+            try:
+                migration = Migration(
+                    user_id=user.id,
+                    source_provider='spotify',
+                    target_provider='tidal',
+                    total_tracks=len(tracks),
+                    status='failed',
+                    error_message=str(e)
+                )
+                db.session.add(migration)
+                db.session.commit()
+            except:
+                db.session.rollback()
+
         return jsonify({"error": str(e)}), 500
 
 
@@ -777,8 +950,24 @@ def migrate_playlist():
     if not playlist_id:
         return jsonify({"error": "Playlist ID required"}), 400
 
+    # Get user for tracking
+    user = None
     try:
-        # Get Spotify tracks
+        user, _ = get_user_from_code(spotify_code)
+        if user:
+            allowed, remaining = check_rate_limit(
+                user.id, 'migration',
+                app.config.get('RATE_LIMIT_MIGRATIONS', 50)
+            )
+            if not allowed:
+                return jsonify({
+                    "error": "Daily migration limit reached",
+                    "limit": app.config.get('RATE_LIMIT_MIGRATIONS', 50)
+                }), 429
+    except Exception as e:
+        print(f"Error getting user for migration tracking: {e}")
+
+    try:
         sp, _ = get_spotify_client(spotify_code)
         tidal_session = tidal_sessions[tidal_session_id]["session"]
 
@@ -808,9 +997,9 @@ def migrate_playlist():
             query = f"{track['name']} {track['artist']}"
             try:
                 results = tidal_session.search(query, models=[tidalapi.media.Track], limit=1)
-                tracks = results.get("tracks", [])
-                if tracks:
-                    tidal_track_ids.append(tracks[0].id)
+                found = results.get("tracks", [])
+                if found:
+                    tidal_track_ids.append(found[0].id)
                 else:
                     not_found.append(track)
             except:
@@ -820,9 +1009,43 @@ def migrate_playlist():
         description = f"Migrated from Spotify"
         playlist = tidal_session.user.create_playlist(playlist_name or "Migrated Playlist", description)
 
-        # Add tracks to playlist
         if tidal_track_ids:
             playlist.add(tidal_track_ids)
+
+        # Log migration to database
+        if user:
+            try:
+                migration = Migration(
+                    user_id=user.id,
+                    source_provider='spotify',
+                    target_provider='tidal',
+                    source_playlist_id=playlist_id,
+                    source_playlist_name=playlist_name,
+                    target_playlist_id=str(playlist.id),
+                    target_playlist_name=playlist.name,
+                    migration_type='playlist',
+                    total_tracks=len(spotify_tracks),
+                    migrated_tracks=len(tidal_track_ids),
+                    skipped_tracks=len(not_found),
+                    not_found_tracks=not_found[:10],
+                    status='completed',
+                    completed_at=datetime.utcnow()
+                )
+                db.session.add(migration)
+                db.session.commit()
+
+                increment_usage(user.id, 'migration', len(spotify_tracks))
+
+                log_activity(user.id, 'migration', {
+                    'type': 'playlist',
+                    'playlist_name': playlist_name,
+                    'total': len(spotify_tracks),
+                    'migrated': len(tidal_track_ids),
+                    'not_found': len(not_found)
+                })
+            except Exception as e:
+                print(f"Error logging migration: {e}")
+                db.session.rollback()
 
         return jsonify({
             "success": True,
@@ -831,10 +1054,42 @@ def migrate_playlist():
             "total_tracks": len(spotify_tracks),
             "migrated": len(tidal_track_ids),
             "not_found": len(not_found),
-            "not_found_tracks": not_found[:10]  # Return first 10 not found for reference
+            "not_found_tracks": not_found[:10]
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+# ==================== DATABASE INITIALIZATION ====================
+
+@app.cli.command("init-db")
+def init_db():
+    """Initialize the database."""
+    db.create_all()
+    print("Database tables created.")
+
+
+@app.cli.command("seed-db")
+def seed_db():
+    """Seed the database with test data."""
+    # Create a test user
+    test_user = User(
+        email="test@example.com",
+        display_name="Test User",
+        tier="free"
+    )
+    db.session.add(test_user)
+    db.session.commit()
+    print(f"Created test user: {test_user.id}")
+
+
+# Create tables on startup if they don't exist
+with app.app_context():
+    try:
+        db.create_all()
+        print("[DB] Database tables ready")
+    except Exception as e:
+        print(f"[DB] Warning: Could not create tables: {e}")
 
 
 if __name__ == "__main__":
